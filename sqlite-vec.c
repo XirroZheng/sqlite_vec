@@ -4241,6 +4241,7 @@ typedef enum IndexType
   SQLITE_VEC0_INDEX_TYPE_KDTREE = 0,
   SQLITE_VEC0_INDEX_TYPE_IVF = 1,
   SQLITE_VEC0_INDEX_TYPE_HNSW = 2,
+  SQLITE_VEC0_INDEX_TYPE_HYBRID = 3,
 } IndexType;
 
 typedef struct KDNode
@@ -4289,9 +4290,9 @@ typedef struct IVF
   f32 *centroids;      // [nlist * dim]
   InvertedList *lists; // [nlist]
 
-  // training buffer
   f32 *train_vecs;   // [train_capacity * dim]
   i64 *train_rowids; // [train_capacity]
+  bool *deleted;     // [train_capacity]
   int train_size;    // current count
   int train_capacity;
 
@@ -5999,8 +6000,27 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
               sqlite3_mprintf(VEC_CONSTRUCTOR_ERROR "only one index is supported");
           goto error;
         }
+        if (numVectorColumns != 1)
+        {
+          *pzErr = sqlite3_mprintf(
+              VEC_CONSTRUCTOR_ERROR "Only one index column is supported");
+          goto error;
+        }
+        const char *start = value;
+        int len = valueLength;
 
-        indexColumnName = sqlite3_mprintf("%.*s", valueLength, value);
+        if (len > 0 && (*start == '\'' || *start == '"'))
+        {
+          start++;
+          len--;
+        }
+
+        if (len > 0 && (start[len - 1] == '\'' || start[len - 1] == '"'))
+        {
+          len--;
+        }
+
+        indexColumnName = sqlite3_mprintf("%.*s", len, start);
         if (!indexColumnName)
         {
           rc = SQLITE_NOMEM;
@@ -6027,6 +6047,10 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
         else if (sqlite3_strnicmp(key, "create_index_ivf", keyLength) == 0)
         {
           pNew->indexMeta->indexType = SQLITE_VEC0_INDEX_TYPE_IVF;
+        }
+        else if (sqlite3_strnicmp(key, "create_hybrid_index", keyLength) == 0)
+        {
+          pNew->indexMeta->indexType = SQLITE_VEC0_INDEX_TYPE_HYBRID;
         }
         else
         {
@@ -8876,6 +8900,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
   else
   {
   }
+
   rc = vec0_chunks_iter(p, idxStr, argc, argv, &stmtChunks);
   if (rc != SQLITE_OK)
   {
@@ -10754,16 +10779,20 @@ int vec0Update_Delete(sqlite3_vtab *pVTab, sqlite3_value *idValue)
       switch (p->indexMeta->indexType)
       {
       case SQLITE_VEC0_INDEX_TYPE_KDTREE:
-        kdtree_delete(p->indexMeta->indexTree, rowid);
+        rc = kdtree_delete(p->indexMeta->indexTree, rowid);
         break;
       case SQLITE_VEC0_INDEX_TYPE_HNSW:
-        hnsw_delete(p->indexMeta->indexHNSW, rowid);
+        rc = hnsw_delete(p->indexMeta->indexHNSW, rowid);
         break;
       case SQLITE_VEC0_INDEX_TYPE_IVF:
-        ivf_delete_vector(p->indexMeta->indexIVF, rowid);
+        rc = ivf_delete_vector(p->indexMeta->indexIVF, rowid);
         break;
       default:
         break;
+      }
+      if (rc != SQLITE_OK)
+      {
+        return rc;
       }
     }
   }
@@ -12162,10 +12191,8 @@ KDNode *kdtree_insert_rec(KDNode *node, float *point, sqlite3_int64 rowid,
   else
     node->right = kdtree_insert_rec(node->right, point, rowid, depth + 1, dims);
 
-  /* update metadata */
   pullup(node);
 
-  /* trigger rebuild if unbalanced or too many deleted nodes */
   if (is_unbalanced(node) || too_many_deleted(node))
   {
     node = rebuild_subtree(node, dims);
@@ -12263,7 +12290,6 @@ void kdtree_search_topk_rec(KDNode *node, const float *query, int dims,
 {
   if (!node)
     return;
-  /* pushdown not needed in this simple design */
 
   if (!node->deleted)
   {
@@ -12414,13 +12440,11 @@ KDNode *rebuild_subtree(KDNode *root, int dims)
   PointRec *arr = sqlite3_malloc(sizeof(PointRec) * total);
   int idx = 0;
   collect_valid_nodes(root, arr, &idx, dims);
-  /* idx is number of valid points */
+
   KDNode *newroot = build_balanced(arr, 0, idx, 0, dims);
 
-  /* free old subtree (including points) */
-  kdtree_free(root); /* your existing free will free points/nodes */
+  kdtree_free(root);
 
-  /* free temporary arr points (they have been copied into new nodes) */
   free_pointrec_array(arr, idx);
   return newroot;
 }
@@ -12432,7 +12456,7 @@ void collect_valid_nodes(KDNode *n, PointRec *arr, int *idx, int dims)
   collect_valid_nodes(n->left, arr, idx, dims);
   if (!n->deleted)
   {
-    /* copy coordinates */
+
     arr[*idx].point = sqlite3_malloc(sizeof(float) * dims);
     memcpy(arr[*idx].point, n->point, sizeof(float) * dims);
     arr[*idx].rowid = n->rowid;
@@ -12844,7 +12868,6 @@ int invlist_append(InvertedList *l, const f32 *vec, int dim, i64 rowid)
     f32 *nv = (f32 *)sqlite3_realloc(l->vecs, sizeof(f32) * newcap * dim);
     if (!nr || !nv)
     {
-      // keep old pointers if realloc failed (sqlite3_realloc returns NULL but keeps original)
       return SQLITE_NOMEM;
     }
     l->rowids = nr;
@@ -12857,7 +12880,6 @@ int invlist_append(InvertedList *l, const f32 *vec, int dim, i64 rowid)
   return SQLITE_OK;
 };
 
-/* ---------- create / free ---------- */
 IVF *ivf_create(int nlist, int nprobe, int dim)
 {
   if (nlist <= 0 || dim <= 0 || nprobe <= 0)
@@ -12896,13 +12918,22 @@ IVF *ivf_create(int nlist, int nprobe, int dim)
     }
   }
 
-  ivf->train_capacity = IVF_TRAIN_CAP; // 建议可调
+  ivf->train_capacity = IVF_TRAIN_CAP;
   ivf->train_size = 0;
   ivf->trained = false;
 
   ivf->train_vecs = sqlite3_malloc(sizeof(f32) * (size_t)ivf->train_capacity * dim);
   ivf->train_rowids = sqlite3_malloc(sizeof(i64) * ivf->train_capacity);
-
+  ivf->deleted = sqlite3_malloc(sizeof(bool) * ivf->train_capacity);
+  memset(ivf->deleted, 0, sizeof(bool) * ivf->train_capacity);
+  if (!ivf->train_vecs || !ivf->train_rowids || !ivf->deleted)
+  {
+    sqlite3_free(ivf->train_vecs);
+    sqlite3_free(ivf->train_rowids);
+    sqlite3_free(ivf->deleted);
+    sqlite3_free(ivf);
+    return NULL;
+  }
   return ivf;
 }
 
@@ -12923,7 +12954,7 @@ int ivf_train_kmeans(IVF *ivf, const f32 *data, int n, int iters, DistanceFunc d
     return 0;
   size_t dim = ivf->dim;
   int k = ivf->nlist;
-  // temp buffers
+
   int *labels = (int *)sqlite3_malloc(sizeof(int) * n);
   f32 *cent_sum = (f32 *)sqlite3_malloc(sizeof(f32) * (size_t)k * dim);
   int *cent_count = (int *)sqlite3_malloc(sizeof(int) * k);
@@ -12935,20 +12966,42 @@ int ivf_train_kmeans(IVF *ivf, const f32 *data, int n, int iters, DistanceFunc d
     return 0;
   }
 
-  // init centroids: sample first k (or random sample if n > k)
-  for (int c = 0; c < k; c++)
+  // 初始化簇中心，从有效数据中取
+  int valid_count = 0;
+  for (int i = 0; i < ivf->train_size; i++)
+    if (!ivf->deleted[i])
+      valid_count++;
+
+  if (valid_count == 0)
   {
-    int idx = c % n;
-    memcpy(&ivf->centroids[(size_t)c * dim], &data[(size_t)idx * dim], sizeof(f32) * dim);
+    sqlite3_free(labels);
+    sqlite3_free(cent_sum);
+    sqlite3_free(cent_count);
+    return 0; // 没有有效数据，无法训练
   }
 
-  // squared L2 helper inline replaced by using ivf->distfunc (assume it returns distance)
+  // 使用有效数据训练
+  int *valid_indices = (int *)sqlite3_malloc(sizeof(int) * valid_count);
+  int idx = 0;
+  for (int i = 0; i < ivf->train_size; i++)
+    if (!ivf->deleted[i])
+      valid_indices[idx++] = i;
+
+  // 初始化簇中心
+  for (int c = 0; c < k; c++)
+  {
+    int data_idx = valid_indices[c % valid_count];
+    memcpy(&ivf->centroids[(size_t)c * dim],
+           &ivf->train_vecs[(size_t)data_idx * dim],
+           sizeof(f32) * dim);
+  }
+
+  // K-means迭代
   for (int iter = 0; iter < iters; iter++)
   {
-    // assign
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < valid_count; i++)
     {
-      const f32 *vec = &data[(size_t)i * dim];
+      const f32 *vec = &ivf->train_vecs[(size_t)valid_indices[i] * dim];
       int best = 0;
       f32 bestd = distfunc(vec, &ivf->centroids[0], &dim);
       for (int c = 1; c < k; c++)
@@ -12962,20 +13015,20 @@ int ivf_train_kmeans(IVF *ivf, const f32 *data, int n, int iters, DistanceFunc d
       }
       labels[i] = best;
     }
-    // reset sums
+
     memset(cent_sum, 0, sizeof(f32) * (size_t)k * dim);
     memset(cent_count, 0, sizeof(int) * k);
-    // accumulate
-    for (int i = 0; i < n; i++)
+
+    for (int i = 0; i < valid_count; i++)
     {
       int c = labels[i];
       f32 *sum = &cent_sum[(size_t)c * dim];
-      const f32 *vec = &data[(size_t)i * dim];
+      const f32 *vec = &ivf->train_vecs[(size_t)valid_indices[i] * dim];
       for (int d = 0; d < dim; d++)
         sum[d] += vec[d];
       cent_count[c]++;
     }
-    // update centroids
+
     for (int c = 0; c < k; c++)
     {
       f32 *cent = &ivf->centroids[(size_t)c * dim];
@@ -12986,9 +13039,8 @@ int ivf_train_kmeans(IVF *ivf, const f32 *data, int n, int iters, DistanceFunc d
       }
       else
       {
-        // reinit empty centroid by sampling a random point
-        int idx = rand() % n;
-        memcpy(cent, &data[(size_t)idx * dim], sizeof(f32) * dim);
+        int rand_idx = valid_indices[rand() % valid_count];
+        memcpy(cent, &ivf->train_vecs[(size_t)rand_idx * dim], sizeof(f32) * dim);
       }
     }
   }
@@ -12996,6 +13048,9 @@ int ivf_train_kmeans(IVF *ivf, const f32 *data, int n, int iters, DistanceFunc d
   sqlite3_free(labels);
   sqlite3_free(cent_sum);
   sqlite3_free(cent_count);
+  sqlite3_free(valid_indices);
+
+  ivf->trained = true;
   return 1;
 }
 
@@ -13019,12 +13074,11 @@ int ivf_add_vector(IVF *ivf, const f32 *vec, i64 rowid, DistanceFunc distfunc)
   return invlist_append(&ivf->lists[best], vec, dim, rowid);
 }
 
-/* ---------- select nprobe centroid indices (partial selection) ---------- */
 void select_nprobe(const IVF *ivf, const f32 *query, int nprobe, int *out_ids, DistanceFunc distfunc)
 {
   int nlist = ivf->nlist;
   size_t dim = ivf->dim;
-  // compute distances to all centroids
+
   f32 *dists = (f32 *)sqlite3_malloc(sizeof(f32) * nlist);
   int *idxs = (int *)sqlite3_malloc(sizeof(int) * nlist);
   for (int i = 0; i < nlist; i++)
@@ -13032,7 +13086,7 @@ void select_nprobe(const IVF *ivf, const f32 *query, int nprobe, int *out_ids, D
     dists[i] = distfunc(query, &ivf->centroids[(size_t)i * dim], &dim);
     idxs[i] = i;
   }
-  // partial selection: selection sort for nprobe smallest indices
+
   if (nprobe > nlist)
     nprobe = nlist;
   for (int i = 0; i < nprobe; i++)
@@ -13052,9 +13106,6 @@ void select_nprobe(const IVF *ivf, const f32 *query, int nprobe, int *out_ids, D
   sqlite3_free(idxs);
 }
 
-/* ---------- search (IVF-FLAT) ---------- */
-/* out_ids, out_dists must be allocated by caller with length >= topk
-   returns number of hits (<= topk) */
 int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *out_ids, f32 *out_dists, DistanceFunc distfunc)
 {
   if (!ivf || !query || topk <= 0 || !out_ids || !out_dists)
@@ -13064,11 +13115,9 @@ int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *o
   if (nprobe > ivf->nlist)
     nprobe = ivf->nlist;
 
-  // select nprobe centroids
   int *cent_ids = (int *)sqlite3_malloc(sizeof(int) * nprobe);
   select_nprobe(ivf, query, nprobe, cent_ids, distfunc);
 
-  // maintain a max-heap of size topk
   typedef struct
   {
     f32 dist;
@@ -13089,7 +13138,7 @@ int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *o
         heap[heap_size++] = (Hit){d, lst->rowids[j]};
         if (heap_size == topk)
         {
-          // build max-heap
+
           for (int p = topk / 2 - 1; p >= 0; p--)
           {
             int idx = p;
@@ -13114,10 +13163,10 @@ int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *o
       {
         if (d < heap[0].dist)
         {
-          // replace root
+
           heap[0].dist = d;
           heap[0].rowid = lst->rowids[j];
-          // heapify down
+
           int idx = 0;
           while (1)
           {
@@ -13138,17 +13187,16 @@ int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *o
     }
   }
 
-  // convert heap to sorted ascending results
   int res = heap_size;
-  // simple selection: pop max to buffer
+
   Hit *buf = (Hit *)sqlite3_malloc(sizeof(Hit) * (size_t)res);
   for (int i = res - 1; i >= 0; i--)
   {
     buf[i] = heap[0];
-    // move last to root
+
     heap[0] = heap[heap_size - 1];
     heap_size--;
-    // heapify down
+
     int idx = 0;
     while (1 && heap_size > 0)
     {
@@ -13166,7 +13214,6 @@ int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *o
     }
   }
 
-  // write out arrays in ascending order (smallest dist first)
   for (int i = 0; i < res; i++)
   {
     out_ids[i] = buf[i].rowid;
@@ -13182,7 +13229,7 @@ int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *o
 int ivf_add_to_train(IVF *ivf, const f32 *vec, i64 rowid)
 {
   if (ivf->train_size >= ivf->train_capacity)
-    return SQLITE_NOMEM;
+    return SQLITE_FULL;
   size_t dim = ivf->dim;
   memcpy(&ivf->train_vecs[(size_t)ivf->train_size * dim],
          vec, sizeof(f32) * dim);
@@ -13194,14 +13241,14 @@ int ivf_add_to_train(IVF *ivf, const f32 *vec, i64 rowid)
 
 int ivf_train_and_flush(IVF *ivf, DistanceFunc distfunc)
 {
-  // 1. 训练
+  //  训练
   if (!ivf_train_kmeans(ivf, ivf->train_vecs, ivf->train_size, 20, distfunc))
     return SQLITE_ERROR;
 
   ivf->trained = true;
   size_t dim = ivf->dim;
 
-  // 2. flush 批量加入倒排链
+  // flush 批量加入倒排链
   for (int i = 0; i < ivf->train_size; i++)
   {
     int rc = ivf_add_vector(
@@ -13212,7 +13259,6 @@ int ivf_train_and_flush(IVF *ivf, DistanceFunc distfunc)
       return rc;
   }
 
-  // 3. 清空训练缓存
   ivf->train_size = 0;
   return SQLITE_OK;
 }
@@ -13220,13 +13266,15 @@ int ivf_train_and_flush(IVF *ivf, DistanceFunc distfunc)
 int ivf_delete_vector(IVF *ivf, i64 rowid)
 {
   if (!ivf)
-    return -1;
+    return -1; // 未找到
   if (!ivf->trained)
-    return -1;
-  
+  {
+    ivf->deleted[rowid - 1] = true;
+    return -2; // 标记已经删除了
+  }
+
   int dim = ivf->dim;
 
-  // 遍历所有 inverted lists
   for (int l = 0; l < ivf->nlist; l++)
   {
     InvertedList *lst = &ivf->lists[l];
@@ -13254,13 +13302,27 @@ int ivf_delete_vector(IVF *ivf, i64 rowid)
 
 int ivf_update_vector_reinsert(IVF *ivf, i64 rowid, const f32 *vec, DistanceFunc distfunc)
 {
-  if (!ivf->trained)
-    return SQLITE_OK;
 
   size_t dim = ivf->dim;
 
+  if (!ivf->trained)
+  {
+    if (ivf->deleted[rowid - 1])
+    {
+      // 已逻辑删除，则直接复用
+      memcpy(&ivf->train_vecs[(rowid - 1) * dim], vec, sizeof(f32) * dim);
+      ivf->deleted[rowid - 1] = false; // 恢复有效
+    }
+    else
+    {
+      // 覆盖原向量
+      memcpy(&ivf->train_vecs[(rowid - 1) * dim], vec, sizeof(f32) * dim);
+    }
+    return SQLITE_OK;
+  }
+
   int old_list = ivf_delete_vector(ivf, rowid);
-  if (old_list < 0)
+  if (old_list < 0) // 就是未找到或者已经删除过了
     return SQLITE_OK;
 
   float min_dist = 1e30f;
@@ -13520,10 +13582,8 @@ int serialize_ivf(IVF *ivf, const char *path)
   fwrite(&ivf->dim, sizeof(int), 1, f);
   fwrite(&ivf->trained, sizeof(bool), 1, f);
 
-  // centroids
   fwrite(ivf->centroids, sizeof(float), ivf->nlist * ivf->dim, f);
 
-  // inverted lists
   for (int i = 0; i < ivf->nlist; i++)
   {
     InvertedList *lst = &ivf->lists[i];
@@ -13533,7 +13593,6 @@ int serialize_ivf(IVF *ivf, const char *path)
     fwrite(lst->vecs, sizeof(float), lst->cap * ivf->dim, f);
   }
 
-  // Training buffer — even if trained = false
   fwrite(&ivf->train_size, sizeof(int), 1, f);
   fwrite(&ivf->train_capacity, sizeof(int), 1, f);
 
@@ -13578,7 +13637,6 @@ IVF *deserialize_ivf(const char *path)
     fread(lst->vecs, sizeof(float), lst->cap * ivf->dim, f);
   }
 
-  // Deserialize training buffer
   fread(&ivf->train_size, sizeof(int), 1, f);
   fread(&ivf->train_capacity, sizeof(int), 1, f);
 
