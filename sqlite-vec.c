@@ -1401,8 +1401,6 @@ int ensure_vector_match(sqlite3_value *aValue, sqlite3_value *bValue, void **a,
   return SQLITE_OK;
 }
 
-int _cmp(const void *a, const void *b) { return (*(i64 *)a - *(i64 *)b); }
-
 struct VecNpyFile
 {
   char *path;
@@ -4320,7 +4318,7 @@ typedef struct IVF
 
 int hnsw_add(HNSW *h, const f32 *vec, int rowid, DistanceFunc distfunc);
 HNSW *hnsw_create(int max_nodes, int dim);
-int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists, int topk, DistanceFunc dist_func);
+int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists, int topk, RowidMap *map, DistanceFunc dist_func);
 void hnsw_print(HNSW *h);
 void connect_nodes(HNSWNode *a, HNSWNode *b, int level);
 HNSWNode *node_create(int id, int rowid, const f32 *vec, int dim);
@@ -4369,8 +4367,8 @@ KDNode *rebuild_subtree(KDNode *root, int dims);
 
 int ivf_train_and_flush(IVF *ivf, DistanceFunc distfunc);
 int ivf_add_to_train(IVF *ivf, const f32 *vec, i64 rowid);
-int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *out_ids, f32 *out_dists, DistanceFunc distfunc);
-int ivf_add_vector(IVF *ivf, const f32 *vec, i64 rowid, DistanceFunc disfunc);
+int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *out_ids, f32 *out_dists, RowidMap *map, DistanceFunc distfunc);
+int ivf_add_vector(IVF *ivf, const f32 *vec, i64 rowid, DistanceFunc distfunc);
 int ivf_train_kmeans(IVF *ivf, const f32 *data, int n, int iters, DistanceFunc distfunc);
 IVF *ivf_create(int nlist, int nprobe, int dim);
 int ivf_delete_vector(IVF *ivf, i64 rowid);
@@ -6035,21 +6033,7 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
               VEC_CONSTRUCTOR_ERROR "Only one index column is supported");
           goto error;
         }
-        const char *start = value;
-        int len = valueLength;
-
-        if (len > 0 && (*start == '\'' || *start == '"'))
-        {
-          start++;
-          len--;
-        }
-
-        if (len > 0 && (start[len - 1] == '\'' || start[len - 1] == '"'))
-        {
-          len--;
-        }
-
-        indexColumnName = sqlite3_mprintf("%.*s", len, start);
+        indexColumnName = sqlite3_mprintf("%.*s", valueLength, value);
         if (!indexColumnName)
         {
           rc = SQLITE_NOMEM;
@@ -8380,7 +8364,7 @@ int vec0Filter_knn_chunks_iter(vec0_vtab *p, sqlite3_stmt *stmtChunks,
         }
         i64 rowid = chunkRowids[i];
         void *in = bsearch(&rowid, arrayRowidsIn->z, arrayRowidsIn->length,
-                           sizeof(i64), _cmp);
+                           sizeof(i64), cmp_i64);
         bitmap_set(bmRowids, i, in ? 1 : 0);
       }
       bitmap_and_inplace(b, bmRowids, p->chunk_size);
@@ -8715,7 +8699,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
       goto cleanup;
     }
     qsort(arrayRowidsIn->z, arrayRowidsIn->length, arrayRowidsIn->element_size,
-          _cmp);
+          cmp_i64);
   }
 #endif
 
@@ -8867,6 +8851,11 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     goto cleanup;
   }
   rc = vec0Filter_chunks_to_rowid_map(p, stmtChunks, arrayRowidsIn, aMetadataIn, idxStr, argc, argv, out_map);
+
+  // for (int i = 0; i < out_map->count; i++)
+  // {
+  //   printf("[%d](%lld)", i, out_map->rowids[i]);
+  // }
   if (rc != SQLITE_OK && rc != SQLITE_DONE)
   {
     goto cleanup;
@@ -8912,6 +8901,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
                               topk_rowids,
                               topk_distances,
                               k,
+                              out_map,
                               p->indexMeta->distfunc);
 
     knn_data->current_idx = 0;
@@ -8943,7 +8933,9 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
         k,
         IVF_N_PROBE,
         topk_rowids,
-        topk_distances, p->indexMeta->distfunc);
+        topk_distances,
+        out_map,
+        p->indexMeta->distfunc);
 
     knn_data->current_idx = 0;
     knn_data->k = k;
@@ -12729,7 +12721,7 @@ int hnsw_add(HNSW *h, const f32 *vec, int rowid, DistanceFunc distfunc)
   return SQLITE_OK;
 }
 
-int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists, int topk, DistanceFunc dist_func)
+int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists, int topk, RowidMap *map, DistanceFunc dist_func)
 {
   int ep = h->entry_id;
   HNSWNode *cur = h->nodes[ep];
@@ -12773,12 +12765,13 @@ int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists,
   while (qh < qt && results < ef)
   {
     HNSWNode *n = h->nodes[q[qh++]];
-    if (n->deleted)
-      continue; // 忽略删除节点
-
-    f32 d = dist_func(n->vec, query, &h->dim);
-    out_ids[results] = n->rowid;
-    out_dists[results++] = d;
+    int valid = bsearch(&n->rowid, map->rowids, map->count, sizeof(i64), cmp_i64) != NULL;
+    if (!n->deleted && valid)
+    {
+      f32 d = dist_func(n->vec, query, &h->dim);
+      out_ids[results] = n->rowid;
+      out_dists[results++] = d;
+    }
 
     for (int i = 0; i < n->nbor_count[0]; i++)
     {
@@ -13161,7 +13154,7 @@ void select_nprobe(const IVF *ivf, const f32 *query, int nprobe, int *out_ids, D
   sqlite3_free(idxs);
 }
 
-int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *out_ids, f32 *out_dists, DistanceFunc distfunc)
+int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *out_ids, f32 *out_dists, RowidMap *map, DistanceFunc distfunc)
 {
   if (!ivf || !query || topk <= 0 || !out_ids || !out_dists)
     return 0;
@@ -13178,14 +13171,22 @@ int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *o
     f32 dist;
     i64 rowid;
   } Hit;
+
   Hit *heap = (Hit *)sqlite3_malloc(sizeof(Hit) * (size_t)topk);
   int heap_size = 0;
 
   for (int ci = 0; ci < nprobe; ci++)
   {
     InvertedList *lst = &ivf->lists[cent_ids[ci]];
+
     for (int j = 0; j < lst->count; j++)
     {
+      
+      i64 rid = lst->rowids[j];
+      int valid = bsearch(&rid, map->rowids, map->count, sizeof(i64), cmp_i64) != NULL;
+      if (!valid)
+        continue;
+
       const f32 *v = &lst->vecs[(size_t)j * dim];
       f32 d = distfunc(query, v, &dim);
       if (heap_size < topk)
@@ -13823,7 +13824,7 @@ int vec0Filter_chunks_to_rowid_map(
         if (!bitmap_get(chunkValidity, i))
           continue;
         i64 rowid = chunkRowids[i];
-        void *in = bsearch(&rowid, arrayRowidsIn->z, arrayRowidsIn->length, sizeof(i64), _cmp);
+        void *in = bsearch(&rowid, arrayRowidsIn->z, arrayRowidsIn->length, sizeof(i64), cmp_i64);
         bitmap_set(bmRowids, i, in ? 1 : 0);
       }
       bitmap_and_inplace(b, bmRowids, p->chunk_size);
