@@ -4375,6 +4375,7 @@ int ivf_train_kmeans(IVF *ivf, const f32 *data, int n, int iters, DistanceFunc d
 IVF *ivf_create(int nlist, int nprobe, int dim);
 int ivf_delete_vector(IVF *ivf, i64 rowid);
 int ivf_update_vector_reinsert(IVF *ivf, i64 rowid, const f32 *vec, DistanceFunc distfunc);
+void ivf_print(const IVF *ivf);
 int serialize_ivf(IVF *ivf, const char *path);
 IVF *deserialize_ivf(const char *path);
 void ivf_free(IVF *ivf);
@@ -10536,6 +10537,7 @@ int vec0Update_Insert(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv,
                 vtab_set_error(pVTab, "IVF: training failed");
                 goto cleanup;
               }
+              //ivf_print(ivf);
             }
           }
           else
@@ -13953,4 +13955,56 @@ cleanup:
   sqlite3_free(bmRowids);
   sqlite3_free(bmMetadata);
   return rc;
+}
+
+void ivf_print(const IVF *ivf)
+{
+  if (!ivf)
+  {
+    printf("IVF = NULL\n");
+    return;
+  }
+
+  printf("==== IVF Info ====\n");
+  printf("trained = %d\n", ivf->trained);
+  printf("nlist   = %d\n", ivf->nlist);
+  printf("nprobe  = %d\n", ivf->nprobe);
+  printf("dim     = %d\n", ivf->dim);
+
+  /* 打印每个 list 的 item 数量 */
+  if (!ivf->lists)
+  {
+    printf("lists = NULL\n");
+    return;
+  }
+
+  printf("\n-- Inverted Lists --\n");
+  for (int i = 0; i < ivf->nlist; i++)
+  {
+    printf("list[%d]: count = %d\n",
+           i,
+           ivf->lists[i].count);
+  }
+
+  /* 打印质心 */
+  if (!ivf->centroids)
+  {
+    printf("\ncentroids = NULL\n");
+    return;
+  }
+
+  printf("\n-- Centroids --\n");
+  for (int i = 0; i < ivf->nlist; i++)
+  {
+    printf("centroid[%d] = [", i);
+    for (int d = 0; d < ivf->dim; d++)
+    {
+      printf("%f", ivf->centroids[i * ivf->dim + d]);
+      if (d + 1 < ivf->dim)
+        printf(", ");
+    }
+    printf("]\n");
+  }
+
+  printf("==== END IVF ====\n");
 }
