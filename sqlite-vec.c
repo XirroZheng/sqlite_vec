@@ -8969,6 +8969,10 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     }
     case SQLITE_VEC0_INDEX_TYPE_IVF:
     {
+      if (!p->indexMeta->indexIVF->trained)
+      {
+        goto ivf_untrained;
+      }
       i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * (K_EXT * k));
       f32 *topk_distances = sqlite3_malloc(sizeof(f32) * (K_EXT * k));
       if (!topk_rowids || !topk_distances)
@@ -9006,6 +9010,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
   }
   else
   {
+  ivf_untrained:
     i64 *topk_rowids = NULL;
     f32 *topk_distances = NULL;
     i64 k_used = 0;
@@ -9027,20 +9032,6 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     pCur->knn_data = knn_data;
     pCur->query_plan = VEC0_QUERY_PLAN_KNN;
     rc = SQLITE_OK;
-    goto cleanup;
-  }
-
-  // 后过滤
-  if (!out_map->pre_filter)
-  {
-    knn_data->current_idx = 0;
-    knn_data->k = k;
-    knn_data->rowids = topk_rowids;
-    knn_data->distances = topk_distances;
-    knn_data->k_used = k_used;
-
-    pCur->knn_data = knn_data;
-
     goto cleanup;
   }
 
@@ -14000,7 +13991,6 @@ void ivf_print(const IVF *ivf)
            i,
            ivf->lists[i].count);
   }
-
 
   if (!ivf->centroids)
   {
