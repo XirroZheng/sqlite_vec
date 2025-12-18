@@ -13971,7 +13971,6 @@ void ivf_print(const IVF *ivf)
   printf("nprobe  = %d\n", ivf->nprobe);
   printf("dim     = %d\n", ivf->dim);
 
-  /* 打印每个 list 的 item 数量 */
   if (!ivf->lists)
   {
     printf("lists = NULL\n");
@@ -13986,7 +13985,7 @@ void ivf_print(const IVF *ivf)
            ivf->lists[i].count);
   }
 
-  /* 打印质心 */
+
   if (!ivf->centroids)
   {
     printf("\ncentroids = NULL\n");
