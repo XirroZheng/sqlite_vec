@@ -4214,6 +4214,7 @@ static int cmp_i64(const void *a, const void *b)
   return 0;
 }
 
+#define K_EXT 2 // KNN查询时K的冗余倍数
 // kdtree-局部rebuild参数
 #define ALPHA_BAL 0.75f /* if left or right > ALPHA_BAL * size -> unbalanced */
 #define ALPHA_DEL 0.3f  /* if invalid_count > ALPHA_DEL * size -> rebuild */
@@ -8911,15 +8912,15 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     case SQLITE_VEC0_INDEX_TYPE_HYBRID:
     case SQLITE_VEC0_INDEX_TYPE_KDTREE:
     {
-      i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * k);
-      f32 *topk_distances = sqlite3_malloc(sizeof(f32) * k);
+      i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * (K_EXT * k));
+      f32 *topk_distances = sqlite3_malloc(sizeof(f32) * (K_EXT * k));
       if (!topk_rowids || !topk_distances)
       {
         rc = SQLITE_NOMEM;
         goto cleanup;
       }
 
-      int n_found = kdtree_topk(p->indexMeta->indexTree, queryVector, k,
+      int n_found = kdtree_topk(p->indexMeta->indexTree, queryVector, K_EXT * k,
                                 topk_rowids, topk_distances, out_map, p->indexMeta->distfunc);
 
       knn_data->current_idx = 0;
@@ -8936,6 +8937,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     }
     case SQLITE_VEC0_INDEX_TYPE_HNSW:
     {
+      int k_ext = EF_CONSTRUCTION > k * K_EXT ? k * K_EXT : EF_CONSTRUCTION;
       i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * EF_CONSTRUCTION);
       f32 *topk_distances = sqlite3_malloc(sizeof(f32) * EF_CONSTRUCTION);
       if (!topk_rowids || !topk_distances)
@@ -8949,7 +8951,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
                                 EF_CONSTRUCTION,
                                 topk_rowids,
                                 topk_distances,
-                                k,
+                                k_ext,
                                 out_map,
                                 p->indexMeta->distfunc);
 
@@ -8967,8 +8969,8 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     }
     case SQLITE_VEC0_INDEX_TYPE_IVF:
     {
-      i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * k);
-      f32 *topk_distances = sqlite3_malloc(sizeof(f32) * k);
+      i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * (K_EXT * k));
+      f32 *topk_distances = sqlite3_malloc(sizeof(f32) * (K_EXT * k));
       if (!topk_rowids || !topk_distances)
       {
         rc = SQLITE_NOMEM;
@@ -8978,7 +8980,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
       int n_found = ivf_search(
           p->indexMeta->indexIVF,
           (f32 *)queryVector,
-          k,
+          k * K_EXT,
           IVF_N_PROBE,
           topk_rowids,
           topk_distances,
@@ -9025,6 +9027,20 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     pCur->knn_data = knn_data;
     pCur->query_plan = VEC0_QUERY_PLAN_KNN;
     rc = SQLITE_OK;
+    goto cleanup;
+  }
+
+  // 后过滤
+  if (!out_map->pre_filter)
+  {
+    knn_data->current_idx = 0;
+    knn_data->k = k;
+    knn_data->rowids = topk_rowids;
+    knn_data->distances = topk_distances;
+    knn_data->k_used = k_used;
+
+    pCur->knn_data = knn_data;
+
     goto cleanup;
   }
 
@@ -10537,7 +10553,7 @@ int vec0Update_Insert(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv,
                 vtab_set_error(pVTab, "IVF: training failed");
                 goto cleanup;
               }
-              //ivf_print(ivf);
+              // ivf_print(ivf);
             }
           }
           else
